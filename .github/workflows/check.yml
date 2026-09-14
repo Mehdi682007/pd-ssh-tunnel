@@ -1,0 +1,19 @@
+name: Shell checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax
+        run: bash -n pd-ssh-tunnel.sh
+      - name: ShellCheck
+        run: shellcheck --severity=error pd-ssh-tunnel.sh tests/*.sh
+      - name: Regression tests
+        run: bash tests/test.sh
+      - name: Isolated SSH integration
+        run: sudo bash tests/ssh-integration.sh
+      - name: Key installation transaction
+        run: sudo bash tests/key-install.sh

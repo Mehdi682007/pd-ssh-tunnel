@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="360" viewBox="0 0 860 360">
+  <rect width="860" height="360" rx="16" fill="#101621"/>
+  <g font-family="monospace" font-size="20">
+    <text x="32" y="48" fill="#d292ff">PD - SSH TUNNEL</text>
+    <rect x="30" y="66" width="800" height="48" rx="6" fill="none" stroke="#67d7e8"/>
+    <text x="280" y="97" fill="#67d7e8">SSH Tunnel Manager</text>
+    <text x="32" y="150" fill="#9ca9bc">Version 2.0.0 — menu illustration</text>
+    <text x="32" y="198" fill="#f3f5f8">1) IR Iran / Source server</text>
+    <text x="32" y="234" fill="#f3f5f8">2) Foreign / Destination server</text>
+    <text x="32" y="270" fill="#f3f5f8">3) Diagnostics / repair / migration</text>
+    <text x="32" y="306" fill="#f3f5f8">0) Exit</text>
+  </g>
+</svg>

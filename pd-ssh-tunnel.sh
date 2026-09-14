@@ -46,7 +46,7 @@ SSHD_DROPIN="/etc/ssh/sshd_config.d/90-reverse-tunnel.conf"
 PERF_SYSCTL="/etc/sysctl.d/99-pd-ssh-tunnel-performance.conf"
 PERF_STATE="/var/lib/reverse-ssh-tunnel-performance.before"
 
-VERSION="1.4.0"
+VERSION="2.0.0"
 
 # ---------------------------------------------------------------------
 # Colors
@@ -124,6 +124,7 @@ detect_os() {
         die "Cannot identify the operating system."
 
     # shellcheck disable=SC1091
+    local VERSION ID PRETTY_NAME
     source /etc/os-release
 
     case "${ID:-}" in
@@ -301,34 +302,25 @@ get_config() {
 
 ensure_key() {
     ensure_dirs
-
-    install_packages openssh-client autossh ca-certificates
-
-    if [[ ! -f "$KEY_FILE" ]]; then
-        info "Generating an Ed25519 SSH key..."
-
-        ssh-keygen \
-            -q \
-            -t ed25519 \
-            -N '' \
-            -C reverse-ssh-tunnel \
-            -f "$KEY_FILE"
-
-        ok "SSH key generated."
-    else
-        ok "Existing SSH key found."
+    command -v ssh-keygen >/dev/null || install_packages openssh-client
+    if [[ ! -e "$KEY_FILE" ]]; then
+        ssh-keygen -q -t ed25519 -N '' -C pd-ssh-tunnel -f "$KEY_FILE" || return 1
     fi
-
-    if [[ ! -f "$PUB_KEY_FILE" ]]; then
-        ssh-keygen -y \
-            -f "$KEY_FILE" \
-            > "$PUB_KEY_FILE"
+    local derived
+    derived=$(mktemp "$APP_DIR/public-key.XXXXXX")
+    if ! ssh-keygen -y -P '' -f "$KEY_FILE" > "$derived"; then
+        rm -f "$derived"
+        warn "Private key unreadable or encrypted; it has NOT been replaced."
+        return 1
     fi
-
+    ssh-keygen -lf "$derived" >/dev/null || { rm -f "$derived"; return 1; }
+    if [[ -f "$PUB_KEY_FILE" ]] && ! cmp -s "$derived" "$PUB_KEY_FILE"; then
+        cp -p "$PUB_KEY_FILE" "$PUB_KEY_FILE.bak.$(date +%s)"
+    fi
+    mv "$derived" "$PUB_KEY_FILE"
     chmod 600 "$KEY_FILE"
     chmod 644 "$PUB_KEY_FILE"
 }
-
 show_public_key() {
     ensure_key
 
@@ -563,7 +555,7 @@ install_public_key_for_tunnel_user() {
         candidate=$(mktemp "$home_dir/.ssh/authorized_keys.new.XXXXXX")
 
         if [[ -s "$home_dir/.ssh/authorized_keys" ]]; then
-            cat "$home_dir/.ssh/authorized_keys" > "$candidate"
+            awk '{print}' "$home_dir/.ssh/authorized_keys" > "$candidate"
         fi
 
         printf '%s\n' "$pubkey" >> "$candidate"
@@ -822,12 +814,20 @@ foreign_uninstall() {
 # Automatic key installation
 # ---------------------------------------------------------------------
 
-install_key_automatically() {
+install_key_automatically() (
     local server="$1"
     local ssh_port="$2"
     local admin_user="$3"
+    local control_dir state
 
-    install_packages openssh-client
+    [[ "$admin_user" == root ]] || { warn "Automatic setup requires the root SSH account."; return 1; }
+    ensure_key || return 1
+    control_dir=$(mktemp -d)
+    trap 'ssh -S "$control_dir/socket" -O exit -p "$ssh_port" "$admin_user@$server" >/dev/null 2>&1 || true; rm -f "$control_dir/socket" "$control_dir/result"; rmdir "$control_dir" 2>/dev/null || true' EXIT
+    ssh -MNf -S "$control_dir/socket" -p "$ssh_port" -o ConnectTimeout=10 \
+        -o "BatchMode=${PD_BATCH:-no}" \
+        -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS" \
+        -o ControlPersist=120 "$admin_user@$server" || return 1
 
     echo
     info "Connecting to the foreign server as $admin_user..."
@@ -838,20 +838,43 @@ install_key_automatically() {
 
     local pubkey
     local pubkey_b64
+    local policy_b64
 
-    pubkey=$(cat "$PUB_KEY_FILE")
+    pubkey=$(ssh-keygen -y -P '' -f "$KEY_FILE") || return 1
     pubkey_b64=$(printf '%s' "$pubkey" | base64 -w 0)
+    policy_b64=$(forward_policy | base64 -w 0) || return 1
 
     info "Configuring the dedicated tunnel account..."
 
-    if ! ssh \
+    if ssh \
+        -T -S "$control_dir/socket" \
         -p "$ssh_port" \
         -o ConnectTimeout=10 \
         -o StrictHostKeyChecking=yes \
         -o UserKnownHostsFile="$KNOWN_HOSTS" \
         "$admin_user@$server" \
-        "TUNNEL_USER='$TUNNEL_USER' PUBKEY_B64='$pubkey_b64' bash -s" <<'REMOTE'
+        "TUNNEL_USER='$TUNNEL_USER' PUBKEY_B64='$pubkey_b64' POLICY_B64='$policy_b64' bash -s" > "$control_dir/result" <<'REMOTE'
 set -Eeuo pipefail
+
+transaction_dir=$(mktemp -d /var/lib/pd-ssh-key-backup.XXXXXX)
+key_path=""
+rollback_key_install() {
+    local rc=$?
+    if (( rc != 0 )); then
+        if [[ -n "$key_path" && -f "$transaction_dir/keys" ]]; then
+            cp -p "$transaction_dir/keys" "$key_path"
+        elif [[ -n "$key_path" ]]; then
+            rm -f "$key_path"
+        fi
+        if [[ -f "$transaction_dir/dropin" ]]; then
+            cp -p "$transaction_dir/dropin" /etc/ssh/sshd_config.d/90-reverse-tunnel.conf
+        elif [[ -n "$key_path" ]]; then
+            rm -f /etc/ssh/sshd_config.d/90-reverse-tunnel.conf
+        fi
+        echo "Installation failed (status $rc); backup: $transaction_dir" >&2
+    fi
+}
+trap rollback_key_install EXIT
 
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
     echo "The administrative SSH account must have root privileges." >&2
@@ -898,6 +921,10 @@ install -d \
     "$HOME_DIR/.ssh"
 
 AUTHORIZED_KEYS="$HOME_DIR/.ssh/authorized_keys"
+key_path="$AUTHORIZED_KEYS"
+printf '%s\n' "$key_path" > "$transaction_dir/key-path"
+[[ ! -f "$AUTHORIZED_KEYS" ]] || cp -p "$AUTHORIZED_KEYS" "$transaction_dir/keys"
+[[ ! -f /etc/ssh/sshd_config.d/90-reverse-tunnel.conf ]] || cp -p /etc/ssh/sshd_config.d/90-reverse-tunnel.conf "$transaction_dir/dropin"
 touch "$AUTHORIZED_KEYS"
 
 BACKUP=""
@@ -913,7 +940,7 @@ if ! grep -qxF "$PUBKEY" \
     CANDIDATE="$(mktemp "$HOME_DIR/.ssh/authorized_keys.new.XXXXXX")"
 
     if [[ -s "$AUTHORIZED_KEYS" ]]; then
-        cat "$AUTHORIZED_KEYS" > "$CANDIDATE"
+        awk '{print}' "$AUTHORIZED_KEYS" > "$CANDIDATE"
     fi
 
     printf '%s\n' "$PUBKEY" >> "$CANDIDATE"
@@ -966,9 +993,12 @@ Match User $TUNNEL_USER
     AllowAgentForwarding no
     AllowTcpForwarding yes
     GatewayPorts clientspecified
+Match all
 EOF
 
 chmod 644 "$SSH_DROPIN"
+printf '%s' "$POLICY_B64" | base64 -d >> "$SSH_DROPIN"
+printf '\nMatch all\n' >> "$SSH_DROPIN"
 
 install -d -o root -g root -m 0755 /run/sshd
 
@@ -982,6 +1012,7 @@ else
     systemctl restart ssh 2>/dev/null ||
         systemctl restart sshd
 fi
+printf 'PD_TRANSACTION=%s\n' "$transaction_dir"
 REMOTE
     then
 
@@ -990,6 +1021,7 @@ REMOTE
     else
 
         warn "Automatic foreign-server configuration failed."
+        cat "$control_dir/result" >&2
         return 1
     fi
 
@@ -1001,77 +1033,48 @@ REMOTE
         return 0
     fi
 
-    warn "SSH authentication failed."
+    state=$(sed -n 's/^PD_TRANSACTION=//p' "$control_dir/result" | tail -n1)
+    if [[ "$state" =~ ^/var/lib/pd-ssh-key-backup\.[A-Za-z0-9]+$ ]]; then
+        ssh -T -S "$control_dir/socket" -p "$ssh_port" "$admin_user@$server" "bash -s -- '$state'" <<'ROLLBACK'
+set -eu
+state="$1"
+key_path=$(cat "$state/key-path")
+if [ -f "$state/keys" ]; then cp -p "$state/keys" "$key_path"; else rm -f "$key_path"; fi
+if [ -f "$state/dropin" ]; then
+    cp -p "$state/dropin" /etc/ssh/sshd_config.d/90-reverse-tunnel.conf
+else rm -f /etc/ssh/sshd_config.d/90-reverse-tunnel.conf; fi
+/usr/sbin/sshd -t
+systemctl reload ssh 2>/dev/null || systemctl reload sshd
+ROLLBACK
+    fi
+    warn "SSH authentication failed; previous key/config restored when the administrative connection was available."
     return 1
-}
+)
 
 # ---------------------------------------------------------------------
 # SSH connection test
 # ---------------------------------------------------------------------
 
-test_ssh_connection() {
+test_ssh_connection() (
     local server="${1:-$(get_config SERVER_HOST)}"
-    local ssh_port="${2:-$(get_config SSH_PORT)}"
-
-    ssh_port="${ssh_port:-22}"
-
-    [[ -n "$server" ]] ||
-        return 1
-
-    ensure_key
-
-    [[ -s "$KNOWN_HOSTS" ]] ||
-        return 1
-
-    info "Testing SSH authentication to $TUNNEL_USER@$server:$ssh_port..."
-
-    # The tunnel user intentionally has /usr/sbin/nologin.
-    # Therefore we test authentication by opening a session without
-    # requiring an interactive shell. The expected nologin message
-    # still means public-key authentication succeeded.
-    local output=""
-    local rc=0
-
-    output=$(
-        ssh \
-            -p "$ssh_port" \
-            -i "$KEY_FILE" \
-            -o BatchMode=yes \
-            -o ConnectTimeout=8 \
-            -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile="$KNOWN_HOSTS" \
-            "$TUNNEL_USER@$server" \
-            2>&1
-    ) || rc=$?
-
-    if grep -q \
-        "This account is currently not available" \
-        <<< "$output"; then
-
-        ok "SSH public-key authentication successful."
+    local port="${2:-$(get_config SSH_PORT)}"
+    port="${port:-22}"
+    [[ -n "$server" && -s "$KNOWN_HOSTS" ]] || return 1
+    ensure_key || return 1
+    local dir rc=0
+    dir=$(mktemp -d)
+    trap 'ssh -S "$dir/control" -O exit -p "$port" "$TUNNEL_USER@$server" >/dev/null 2>&1 || true; rm -f "$dir/control" "$dir/error"; rmdir "$dir" 2>/dev/null || true' EXIT
+    ssh -M -S "$dir/control" -fNT -i "$KEY_FILE" -p "$port" \
+        -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=8 \
+        -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS" \
+        -o ControlPersist=15 "$TUNNEL_USER@$server" 2>"$dir/error" || rc=$?
+    if (( rc == 0 )) && ssh -S "$dir/control" -O check -p "$port" "$TUNNEL_USER@$server" 2>/dev/null; then
+        ok "Public-key authentication verified (no login shell required)."
         return 0
     fi
-
-    if [[ "$rc" -eq 0 ]]; then
-        ok "SSH authentication successful."
-        return 0
-    fi
-
-    if grep -qiE \
-        "Permission denied|No supported authentication methods" \
-        <<< "$output"; then
-
-        warn "SSH authentication failed."
-        echo "$output"
-
-        return 1
-    fi
-
-    warn "SSH test returned an unexpected result."
-    echo "$output"
-
+    cat "$dir/error" >&2
     return 1
-}
+)
 
 # ---------------------------------------------------------------------
 # Port forwarding
@@ -1150,6 +1153,13 @@ add_forward() {
     valid_host "$target_host" || die "Invalid target host."
 
     line="$prefix|$bind_host:$bind_port:$target_host:$target_port"
+    validate_forward "$line" || die 'Invalid forward: use IPv4/hostname endpoints and numeric ports.'
+    if [[ "$prefix" == L ]] && ss -lntH | awk -v p=":$bind_port" '$4 ~ p"$" {found=1} END {exit !found}'; then
+        warn "Local port $bind_port is already listening. Select another port."
+        return 1
+    fi
+    printf 'Planned route: %s %s:%s -> %s:%s\n' "$prefix" "$bind_host" "$bind_port" "$target_host" "$target_port"
+    read_yes_no 'Save this forward?' || return 0
 
     if grep -qxF "$line" "$FORWARDS_FILE" 2>/dev/null; then
         warn "This exact forward already exists."
@@ -1170,6 +1180,11 @@ add_forward() {
 
     echo
 
+    info 'Synchronizing destination port permissions; administrative SSH may request its password.'
+    install_key_automatically "$(get_config SERVER_HOST)" "$(get_config SSH_PORT)" root || {
+        warn 'Rule saved but permissions were not synchronized. Run Repair before using it.'
+        return 1
+    }
     if read_yes_no "Restart the tunnel now?"; then
         restart_tunnel
     fi
@@ -1375,7 +1390,11 @@ net.ipv4.tcp_slow_start_after_idle = 0
 EOF
 
     chmod 644 "$PERF_SYSCTL"
-    sysctl --system >/dev/null
+    if ! sysctl -p "$PERF_SYSCTL"; then
+        warn 'Kernel rejected the profile; restoring previous values.'
+        disable_performance_profile
+        return 1
+    fi
 
     if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" != "bbr" ]]; then
         die "BBR could not be enabled on this kernel."
@@ -1512,16 +1531,22 @@ args=(
     -o "UserKnownHostsFile=$KNOWN_HOSTS"
 
     -o ConnectTimeout=15
+    -o IdentitiesOnly=yes
+    -o ControlMaster=yes
+    -o "ControlPath=$APP_DIR/control"
 
     -i "$KEY_FILE"
     -p "$ssh_port"
 )
 
 if [[ "$performance_mode" == "1" ]]; then
+    cipher_order=chacha20-poly1305@openssh.com,aes128-gcm@openssh.com
+    if grep -qw aes /proc/cpuinfo; then
+        cipher_order=aes128-gcm@openssh.com,chacha20-poly1305@openssh.com
+    fi
     args+=(
         -o Compression=no
-        -o Ciphers=aes128-gcm@openssh.com,chacha20-poly1305@openssh.com
-        -o "RekeyLimit=4G 1h"
+        -o "Ciphers=$cipher_order"
     )
 fi
 
@@ -1620,6 +1645,7 @@ restart_tunnel() {
     [[ -f "$KNOWN_HOSTS" ]] ||
         die "SSH known_hosts is missing."
 
+    validate_forwards_file "$FORWARDS_FILE" || return 1
     build_run_script
     install_systemd_service
 
@@ -1628,7 +1654,7 @@ restart_tunnel() {
     sleep 2
 
     if systemctl is-active --quiet "$UNIT_NAME"; then
-        ok "Tunnel service is running."
+        health_check || return 1
     else
         warn "Tunnel service failed to start."
 
@@ -2349,6 +2375,233 @@ foreign_menu() {
 # Main menu
 # ---------------------------------------------------------------------
 
+# Strict IPv4/hostname forward grammar. Bracketed IPv6 is not supported yet.
+forward_policy() {
+    validate_forwards_file "$FORWARDS_FILE" || return 1
+    local line mode spec bind port target tport open='' listen=''
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        mode=R; spec="$line"
+        if [[ "$line" == *'|'* ]]; then mode="${line%%|*}"; spec="${line#*|}"; fi
+        IFS=: read -r bind port target tport <<< "$spec"
+        if [[ "$mode" == L ]]; then open+=" $target:$tport"; else listen+=" $bind:$port"; fi
+    done < <(get_forward_entries)
+    printf '\nMatch User %s\n    PermitOpen%s\n    PermitListen%s\n' "$TUNNEL_USER" "${open:- none}" "${listen:- none}"
+}
+
+validate_forward() {
+    local line="$1" mode spec bind port target tport extra
+    [[ "$line" == *'|'* ]] || line="R|$line"
+    mode="${line%%|*}"; spec="${line#*|}"
+    [[ "$mode" == L || "$mode" == R ]] || return 1
+    IFS=: read -r bind port target tport extra <<< "$spec"
+    [[ -z "$extra" && "$bind" =~ ^[a-zA-Z0-9.*_-]+$ && "$target" =~ ^[a-zA-Z0-9._-]+$ ]] || return 1
+    [[ "$port" =~ ^[0-9]{1,5}$ && "$tport" =~ ^[0-9]{1,5}$ ]] || return 1
+    (( 10#$port > 0 && 10#$port <= 65535 && 10#$tport > 0 && 10#$tport <= 65535 ))
+}
+
+validate_forwards_file() {
+    local file="$1" line n=0
+    [[ -f "$file" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        n=$((n + 1))
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        validate_forward "$line" || { warn "Invalid forward at line $n. Run Repair to quarantine it."; return 1; }
+    done < "$file"
+}
+
+health_check() {
+    local main child line spec mode bind port target tport failures=0
+    validate_forwards_file "$FORWARDS_FILE" || return 1
+    main=$(systemctl show "$UNIT_NAME" -p MainPID --value 2>/dev/null)
+    if [[ "$main" =~ ^[1-9][0-9]*$ ]]; then
+        child=$(pgrep -P "$main" -x ssh || true)
+    else child=""; fi
+    if [[ -z "$child" ]]; then
+        warn "No SSH worker. autossh running alone does not mean connected."
+        journalctl -u "$UNIT_NAME" -n 12 --no-pager
+        return 1
+    fi
+    ok "SSH worker exists: $child"
+    if ! ssh -S "$APP_DIR/control" -O check -p "$(get_config SSH_PORT)" "$TUNNEL_USER@$(get_config SERVER_HOST)" 2>/dev/null; then
+        warn 'SSH control session is not ready. Restart older tunnel runners to enable this check.'
+        return 1
+    fi
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        mode=R; spec="$line"
+        if [[ "$line" == *'|'* ]]; then mode="${line%%|*}"; spec="${line#*|}"; fi
+        IFS=: read -r bind port target tport <<< "$spec"
+        if [[ "$mode" == L ]]; then
+            if ss -lntH | awk -v port=":$port" '$4 ~ port"$" {found=1} END {exit !found}'; then
+                ok "Local listener $bind:$port exists; destination is $target:$tport"
+            else warn "Missing listener $bind:$port"; failures=$((failures + 1)); fi
+        else
+            info "Reverse endpoint $bind:$port needs a check from the foreign side."
+        fi
+    done < <(get_forward_entries)
+    info "Listener checks do not prove application success. Use an HTTP/SOCKS URL test or the client."
+    (( failures == 0 ))
+}
+
+repair_tunnel() {
+    need_root
+    ensure_config_files
+    ensure_key || return 1
+    local backup tmp line rejected=0
+    backup="$APP_DIR/forwards.conf.bak.$(date +%s)"
+    cp -p "$FORWARDS_FILE" "$backup"
+    tmp=$(mktemp "$APP_DIR/forwards.XXXXXX")
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ -z "$line" || "$line" == \#* ]] || validate_forward "$line"; then
+            printf '%s\n' "$line" >> "$tmp"
+        else rejected=$((rejected + 1)); fi
+    done < "$FORWARDS_FILE"
+    chmod 600 "$tmp"; mv "$tmp" "$FORWARDS_FILE"
+    info "Quarantined $rejected invalid entries; original: $backup"
+    info "Synchronizing destination key and port permissions using administrative SSH."
+    install_key_automatically "$(get_config SERVER_HOST)" "$(get_config SSH_PORT)" root || return 1
+    command -v autossh >/dev/null || install_packages autossh
+    restart_tunnel
+}
+
+application_test() {
+    local url proxy
+    read -r -p 'Test URL (http:// or https://): ' url || return 1
+    read -r -p 'HTTP/SOCKS proxy URL (blank for direct): ' proxy || return 1
+    [[ "$url" == http://* || "$url" == https://* ]] || return 1
+    local options=()
+    [[ -z "$proxy" ]] || options+=(--proxy "$proxy")
+    curl --fail --show-error --max-time 20 "${options[@]}" -o /dev/null \
+        -w 'HTTP=%{http_code} time=%{time_total}s\n' "$url"
+}
+
+benchmark() {
+    local host port label result
+    read -r -p 'iperf3 host (use 127.0.0.1 for a forwarded server): ' host || return 1
+    port=$(read_port_default 'iperf3 port [5201]: ' 5201)
+    read -r -p 'Result label (before/after): ' label || return 1
+    [[ "$host" =~ ^[a-zA-Z0-9._-]+$ && "$label" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
+    command -v iperf3 >/dev/null || install_packages iperf3
+    install -d -m 700 "$APP_DIR/benchmarks"
+    result="$APP_DIR/benchmarks/$(date +%Y%m%d-%H%M%S)-$label"
+    info 'Two 10-second TCP tests consume bandwidth. Start iperf3 -s on the destination first.'
+    ping -c 5 -W 2 "$host" || true
+    iperf3 -c "$host" -p "$port" -t 10 -J > "$result-upload.json" || return 1
+    iperf3 -c "$host" -p "$port" -t 10 -R -J > "$result-download.json" || return 1
+    command -v python3 >/dev/null || install_packages python3
+    python3 - "$APP_DIR/benchmarks" <<'PY'
+import json, pathlib, sys
+print('Result | Mbit/s received | Retransmits | Local CPU %')
+for p in sorted(pathlib.Path(sys.argv[1]).glob('*.json')):
+    try:
+        d=json.loads(p.read_text())['end']
+        print(f"{p.stem} | {d['sum_received']['bits_per_second']/1e6:.2f} | {d.get('sum_sent',{}).get('retransmits','n/a')} | {d.get('cpu_utilization_percent',{}).get('host_total','n/a')}")
+    except (KeyError, ValueError): print(f'{p.stem}: incomplete test')
+PY
+}
+
+export_settings() {
+    local dest="$1"
+    [[ ! -e "$dest" ]] || { warn 'Destination exists; choose a new filename.'; return 1; }
+    validate_forwards_file "$FORWARDS_FILE" || return 1
+    (umask 077; printf 'PD-SSH-SETTINGS-1\n'; get_forward_entries) > "$dest"
+    chmod 600 "$dest"
+    ok "Exported forwarding rules to $dest. Host trust and private keys are intentionally not transferred."
+}
+
+import_settings() {
+    local src="$1" tmp backup
+    [[ -f "$src" && "$(head -n1 "$src")" == PD-SSH-SETTINGS-1 ]] || return 1
+    ensure_config_files
+    tmp=$(mktemp "$APP_DIR/import.XXXXXX")
+    tail -n +2 "$src" > "$tmp"
+    validate_forwards_file "$tmp" || { rm -f "$tmp"; return 1; }
+    backup="$FORWARDS_FILE.bak.$(date +%s)"
+    cp -p "$FORWARDS_FILE" "$backup"
+    chmod 600 "$tmp"; mv "$tmp" "$FORWARDS_FILE"
+    ok "Imported. Backup: $backup. Reconnect to verify destination host/key before starting."
+}
+
+xui_helper() {
+    local line mode spec bind port target tport
+    while IFS= read -r line; do
+        validate_forward "$line" || continue
+        mode=R; spec="$line"
+        if [[ "$line" == *'|'* ]]; then mode="${line%%|*}"; spec="${line#*|}"; fi
+        IFS=: read -r bind port target tport <<< "$spec"
+        if [[ "$mode" == L ]]; then
+            printf '\nSource 3x-ui outbound: address=127.0.0.1 port=%s\nDestination inbound: address=%s port=%s\nUse the destination inbound UUID in the source outbound.\nRoute source inbound -> this outbound; destination inbound -> direct.\n' "$port" "$target" "$tport"
+        else
+            printf '\nReverse: destination listener %s:%s -> source service %s:%s\n' "$bind" "$port" "$target" "$tport"
+        fi
+    done < <(get_forward_entries)
+    info 'Client credentials and TLS/Reality settings belong to 3x-ui; never replace them with SSH keys.'
+}
+
+tools_menu() {
+    local choice file
+    while :; do
+        header
+        printf '%s\n' '1) Health check' '2) Repair source tunnel/key' '3) Application URL test' '4) Throughput benchmark / compare' '5) Export forwards' '6) Import forwards' '7) 3x-ui setup guide' '0) Back'
+        choice=$(read_menu_choice 'Select: ' 7)
+        case "$choice" in
+            1) health_check || true ;;
+            2) repair_tunnel || true ;;
+            3) application_test || true ;;
+            4) benchmark || true ;;
+            5) read -r -p 'Export filename: ' file; export_settings "$file" || true ;;
+            6) read -r -p 'Import filename: ' file; import_settings "$file" || true ;;
+            7) xui_helper ;;
+            0) return ;;
+        esac
+        pause_screen
+    done
+}
+
+cli_main() {
+    local role='' server='' port=22 forward='' action='' file=''
+    while (( $# )); do
+        case "$1" in
+            --help) printf '%s\n' 'Usage: pd-ssh-tunnel.sh --role iran|foreign [--server HOST --port 22] [--forward L|BIND:PORT:TARGET:PORT]' 'Actions: --health --repair --export FILE --import FILE --guide' 'Setup preserves known_hosts checks. First-time host trust/password prompts may be required.'; return ;;
+            --role|--server|--port|--forward|--export|--import)
+                (( $# >= 2 )) || die "Missing value: $1"
+                case "$1" in
+                    --role) role="$2" ;; --server) server="$2" ;; --port) port="$2" ;;
+                    --forward) forward="$2" ;; --export) action=export; file="$2" ;; --import) action=import; file="$2" ;;
+                esac; shift 2 ;;
+            --health|--repair|--guide) action="${1#--}"; shift ;;
+            --batch) PD_BATCH=yes; shift ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+    need_root; detect_os; ensure_config_files
+    case "$action" in
+        health) health_check; return ;; repair) repair_tunnel; return ;;
+        guide) xui_helper; return ;; export) export_settings "$file"; return ;; import) import_settings "$file"; return ;;
+    esac
+    case "$role" in
+        foreign) configure_foreign_ssh ;;
+        iran)
+            valid_host "$server" && valid_port "$port" || die 'Valid --server and --port required.'
+            ensure_key || return 1
+            if [[ "${PD_BATCH:-no}" == yes ]]; then
+                local hostkey_name="$server"
+                [[ "$port" == 22 ]] || hostkey_name="[$server]:$port"
+                ssh-keygen -F "$hostkey_name" -f "$KNOWN_HOSTS" >/dev/null || die 'Batch mode requires a previously verified known_hosts entry.'
+            else safe_ssh_keyscan "$server" "$port" || return 1; fi
+            set_config SERVER_HOST "$server"; set_config SSH_PORT "$port"
+            if [[ -n "$forward" ]]; then
+                validate_forward "$forward" || die 'Invalid --forward.'
+                grep -qxF "$forward" "$FORWARDS_FILE" || printf '%s\n' "$forward" >> "$FORWARDS_FILE"
+            fi
+            install_key_automatically "$server" "$port" root || return 1
+            command -v autossh >/dev/null || install_packages autossh
+            restart_tunnel ;;
+        *) die 'Choose --role iran|foreign or --help.' ;;
+    esac
+}
+
 main_menu() {
     need_root
     detect_os
@@ -2362,6 +2615,7 @@ main_menu() {
 
         echo "  ${CYAN}1${RESET}) IR Iran / Source server"
         echo "  ${CYAN}2${RESET}) 🌍 Foreign / Destination server"
+        echo "  ${CYAN}3${RESET}) Diagnostics / repair / migration"
         echo "  ${CYAN}0${RESET}) 🚪 Exit"
 
         echo
@@ -2370,7 +2624,7 @@ main_menu() {
 
         choice=$(read_menu_choice \
             "Select: " \
-            2)
+            3)
 
         case "$choice" in
 
@@ -2380,6 +2634,10 @@ main_menu() {
 
             2)
                 foreign_menu
+                ;;
+
+            3)
+                tools_menu
                 ;;
 
             0)
@@ -2393,4 +2651,6 @@ main_menu() {
     done
 }
 
-main_menu
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    if (( $# )); then cli_main "$@"; else main_menu; fi
+fi

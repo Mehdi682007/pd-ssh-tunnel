@@ -1,0 +1,21 @@
+name: Bug report
+description: Report a reproducible tunnel problem
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Script version and OS on both servers
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps and expected result
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Health check and sanitized logs
+      description: Remove passwords, private keys, client UUIDs, and personal data.
+      render: text
