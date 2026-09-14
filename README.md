@@ -4,7 +4,7 @@
 
 ![Menu illustration](docs/menu.svg)
 
-[Releases](https://github.com/Mehdi682007/pd-ssh-tunnel/releases) · [Changelog](CHANGELOG.md) · [Video recording guide](docs/TUTORIAL.md) · [MIT License](LICENSE)
+[Releases](https://github.com/Mehdi682007/pd-ssh-tunnel/releases) · [Changelog](CHANGELOG.md) · [MIT License](LICENSE)
 
 
 ## راهنمای فارسی
