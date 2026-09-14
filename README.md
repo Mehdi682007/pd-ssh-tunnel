@@ -6,46 +6,6 @@
 
 [Releases](https://github.com/Mehdi682007/pd-ssh-tunnel/releases) · [Changelog](CHANGELOG.md) · [Video recording guide](docs/TUTORIAL.md) · [MIT License](LICENSE)
 
-## Version 2.0 notes / نکات نسخه جدید
-
-The terminal UI is English only. Diagnostics, Repair, URL tests, benchmark comparison,
-forward export/import and a 3x-ui configuration guide are available from main-menu option 3.
-Automatic key setup requires the destination root SSH account. Only configured endpoints
-are allowed after synchronization; adding a forward synchronizes the destination policy.
-Removing/importing rules requires Repair to synchronize permissions before use.
-This account/policy is for one source configuration per destination, not multiple independent sources.
-
-منوی ترمینال فقط انگلیسی است. ابزارهای جدید در گزینه ۳ منوی اصلی هستند.
-بعد از ارتقا یا انتقال قوانین، Repair را اجرا کن تا کلید، محدودیت پورت‌ها و سرویس هماهنگ شوند.
-بخش انتقال تنظیمات فقط قوانین فوروارد را منتقل می‌کند؛ کلید خصوصی و اعتماد به میزبان منتقل نمی‌شوند.
-تست سرعت پهنای باند مصرف می‌کند و نیاز به iperf3 در سمت مقصد دارد.
-
-```bash
-# CLI help (no root needed)
-bash pd-ssh-tunnel.sh --help
-
-# Source setup; prompts for first-time host trust and administrative password
-sudo bash pd-ssh-tunnel.sh --role iran --server DESTINATION_IP --port 22 \
-  --forward 'L|127.0.0.1:28888:127.0.0.1:28443'
-
-# For automation after host trust and root SSH authentication are provisioned
-sudo bash pd-ssh-tunnel.sh --batch --role iran --server DESTINATION_IP --port 22
-
-sudo bash pd-ssh-tunnel.sh --health
-sudo bash pd-ssh-tunnel.sh --repair
-sudo bash pd-ssh-tunnel.sh --export /root/forwards.txt
-sudo bash pd-ssh-tunnel.sh --import /root/forwards.txt
-```
-
-Health checks verify the SSH control session and local listeners. Application success must
-be checked using the client or a suitable HTTP/SOCKS proxy in the application test.
-Do not point curl's proxy option at a raw VLESS listener.
-For benchmarks, forward a loopback iperf3 listener separately, test before and after,
-and remove the benchmark forward when finished. Performance improvements are not guaranteed.
-The performance profile changes host-wide TCP settings; inspect existing tuning first.
-
-Supported forwarding syntax currently uses IPv4 addresses or hostnames, not bracketed IPv6.
-The current source and destination menu labels are historical names; any compatible servers can be used.
 
 ## راهنمای فارسی
 
