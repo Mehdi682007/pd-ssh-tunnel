@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.1.0
+
+- Add an explicit foreign-initiated reverse-egress wizard in main-menu option 4.
+- Refuse to overwrite an existing initiator configuration during reverse setup.
+- Document the difference between SSH connection direction and forwarded traffic direction.
+- Remove the recording guide from current public documentation.
+
 ## 2.0.0
 
 - Fix inverted success/failure condition in automatic SSH key installation.

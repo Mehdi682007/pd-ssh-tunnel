@@ -9,6 +9,25 @@
 
 ## راهنمای فارسی
 
+### Connection direction / جهت اتصال
+
+The original local-forward setup uses Iran as the SSH initiator (`-L`).
+Main-menu option 4 adds a foreign-initiated reverse setup (`-R`): run it on a
+foreign machine without an existing manager configuration. It connects to Iran
+and creates a loopback listener there. Manage/restart autossh on the foreign
+machine; the existing menu-1 label refers to the initiator in this topology.
+The wizard refuses to overwrite an existing tunnel configuration.
+
+```text
+SSH connection: FOREIGN -> IRAN
+Application: Client -> Iran inbound -> Iran outbound 127.0.0.1:28888
+           -> reverse SSH forward -> foreign inbound 127.0.0.1:28443 -> Internet
+```
+
+تنظیم قدیمی ایران به خارج با `-L` است. گزینه ۴ منوی اصلی را برای اتصال از خارج به ایران با `-R` روی سرور خارج اجرا کنید.
+در این حالت ریستارت و تعمیر تونل روی خارج انجام می‌شود. اگر خارج از قبل کانفیگ تونل دارد، این گزینه آن را بازنویسی نمی‌کند.
+این روش نیازمند دسترسی خارج به پورت SSH ایران است و در قطع کامل ارتباط بین‌المللی تضمینی ندارد.
+
 مدیریت تعاملی تونل SSH پایدار بین سرور ایران و سرور خارج با پشتیبانی از `autossh` و `systemd`.
 
 ## امکانات

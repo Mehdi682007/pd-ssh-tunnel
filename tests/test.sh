@@ -42,4 +42,21 @@ systemctl() { printf '0\n'; }
 journalctl() { :; }
 if health_check; then echo 'False healthy result'; exit 1; fi
 unset -f systemctl journalctl
+# Reverse-egress wizard writes an R rule on the foreign initiator and refuses
+# to overwrite it on a second run. All network/service calls are mocked here.
+: > "$FORWARDS_FILE"
+set_config SERVER_HOST ''
+need_root() { :; }
+header() { :; }
+safe_ssh_keyscan() { :; }
+install_key_automatically() { printf '%s %s %s\n' "$@" > "$fixture/remote-call"; }
+restart_tunnel() { :; }
+autossh() { :; }
+printf '192.0.2.10\n2222\n28888\n28443\ny\n' | setup_reverse_egress
+grep -qx 'R|127.0.0.1:28888:127.0.0.1:28443' "$FORWARDS_FILE"
+[[ "$(get_config SERVER_HOST)" == 192.0.2.10 ]]
+[[ "$(get_config SSH_PORT)" == 2222 ]]
+forward_policy | grep -q 'PermitListen 127.0.0.1:28888'
+forward_policy | grep -q 'PermitOpen none'
+if setup_reverse_egress </dev/null; then echo 'Existing setup overwritten'; exit 1; fi
 echo 'PASS: validation, key repair, allowlist, migration, runner syntax, failed health detection'

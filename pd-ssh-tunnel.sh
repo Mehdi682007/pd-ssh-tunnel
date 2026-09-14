@@ -46,7 +46,7 @@ SSHD_DROPIN="/etc/ssh/sshd_config.d/90-reverse-tunnel.conf"
 PERF_SYSCTL="/etc/sysctl.d/99-pd-ssh-tunnel-performance.conf"
 PERF_STATE="/var/lib/reverse-ssh-tunnel-performance.before"
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 
 # ---------------------------------------------------------------------
 # Colors
@@ -2602,6 +2602,43 @@ cli_main() {
     esac
 }
 
+setup_reverse_egress() {
+    need_root
+    ensure_config_files
+    header
+    printf '%s\n' 'Reverse egress: run this wizard on the FOREIGN server.' \
+        'SSH connection: FOREIGN -> IRAN' \
+        'Traffic: Iran local listener -> SSH -> foreign service' \
+        'The autossh service will run on this machine (FOREIGN).'
+    if [[ -n "$(get_forward_entries)" || -n "$(get_config SERVER_HOST)" ]]; then
+        warn 'This machine already has a tunnel configuration. Use a separate machine or deliberately migrate the existing configuration first.'
+        return 1
+    fi
+    local iran_host iran_port bind_port service_port
+    read -r -p 'Iran SSH IP/hostname: ' iran_host || return 1
+    valid_host "$iran_host" || { warn 'Invalid hostname.'; return 1; }
+    iran_port=$(read_port_default 'Iran SSH port [22]: ' 22) || return 1
+    bind_port=$(read_port_default 'Iran LOOPBACK tunnel port [28888]: ' 28888) || return 1
+    service_port=$(read_port_default 'Foreign service/inbound port [28443]: ' 28443) || return 1
+    printf '\nForeign -> SSH %s:%s; Iran 127.0.0.1:%s -> foreign 127.0.0.1:%s\n' "$iran_host" "$iran_port" "$bind_port" "$service_port"
+    read_yes_no 'Configure this machine as the foreign SSH initiator?' || return 0
+    ensure_key || return 1
+    safe_ssh_keyscan "$iran_host" "$iran_port" || return 1
+    set_config SERVER_HOST "$iran_host"
+    set_config SSH_PORT "$iran_port"
+    set_config TOPOLOGY foreign-initiated-reverse
+    printf 'R|127.0.0.1:%s:127.0.0.1:%s\n' "$bind_port" "$service_port" > "$FORWARDS_FILE"
+    chmod 600 "$FORWARDS_FILE"
+    install_key_automatically "$iran_host" "$iran_port" root || {
+        warn 'Setup is saved. Run Repair on this FOREIGN machine to retry authentication/setup.'
+        return 1
+    }
+    command -v autossh >/dev/null || install_packages autossh
+    restart_tunnel || return 1
+    printf '\nIn Iran 3x-ui, keep the client inbound public and send its outbound to 127.0.0.1:%s.\nUse the UUID/security of the foreign inbound on port %s.\n' "$bind_port" "$service_port"
+    info 'Start, stop, repair and restart this tunnel on the FOREIGN machine. Use menu 1 to manage the local autossh instance; its historical Iran label means initiator.'
+}
+
 main_menu() {
     need_root
     detect_os
@@ -2616,6 +2653,7 @@ main_menu() {
         echo "  ${CYAN}1${RESET}) IR Iran / Source server"
         echo "  ${CYAN}2${RESET}) 🌍 Foreign / Destination server"
         echo "  ${CYAN}3${RESET}) Diagnostics / repair / migration"
+        echo "  ${CYAN}4${RESET}) Reverse egress setup (run on FOREIGN)"
         echo "  ${CYAN}0${RESET}) 🚪 Exit"
 
         echo
@@ -2624,7 +2662,7 @@ main_menu() {
 
         choice=$(read_menu_choice \
             "Select: " \
-            3)
+            4)
 
         case "$choice" in
 
@@ -2638,6 +2676,11 @@ main_menu() {
 
             3)
                 tools_menu
+                ;;
+
+            4)
+                setup_reverse_egress || true
+                pause_screen
                 ;;
 
             0)
