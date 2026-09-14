@@ -108,7 +108,7 @@ header() {
     echo "${MAGENTA}${BOLD}|___|    |______|            |_______||_______||__| |__|    |___|  |_______||_|  |__||_|  |__||_______||_______|${RESET}"
     echo
     echo "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════╗${RESET}"
-    echo "${CYAN}${BOLD}║                 🔐 SSH Tunnel Manager                 ║${RESET}"
+    echo "${CYAN}${BOLD}║                 🔐 SSH Tunnel Manager                    ║${RESET}"
     echo "${CYAN}${BOLD}╚══════════════════════════════════════════════════════════╝${RESET}"
     echo "${DIM}Version $VERSION${RESET}"
     echo
